@@ -1,0 +1,679 @@
+import { jsonResponse, errorResponse, readJsonBody, CORS_HEADERS } from '../lib/http';
+import { requireAuth } from '../lib/auth';
+import {
+  mergeGeneratedOutbounds,
+  parseBaseConfig,
+  parseSelectorTags,
+  stripUnsupportedOutboundFields,
+} from '../lib/config';
+import type { AuthContext, Env, RouteDefinition } from '../lib/context';
+import type { SbConfigRow, VpnLinkRow } from '../models';
+import { fetchLinksByIds } from '../db/links';
+import { fetchGroupById, fetchGroupsByIds } from '../db/groups';
+import {
+  fetchBaseConfigById,
+  fetchConfigById,
+  fetchConfigGroups,
+} from '../db/configs';
+import { convertLinksToOutbounds } from '../converter';
+import { authenticateBasic } from '../lib/auth';
+import { resolveSubscriptionLinks } from '../lib/subscription';
+
+async function handleCreateConfig(
+  request: Request,
+  env: Env,
+  _params: Record<string, string>,
+  _auth: AuthContext,
+): Promise<Response> {
+  const body = await readJsonBody<{
+    name?: string;
+    description?: string;
+    baseConfigId?: string;
+    selectorTags?: string[];
+    groupIds?: string[];
+    shareEnabled?: boolean;
+    shareToken?: string;
+  }>(request);
+  if (!body) return errorResponse('Invalid JSON payload', 400);
+
+  const name = body.name?.trim();
+  if (!name) return errorResponse('`name` is required', 422);
+
+  const description = body.description?.trim() ?? null;
+  const baseConfigId = body.baseConfigId?.trim();
+  if (!baseConfigId) return errorResponse('`baseConfigId` is required', 422);
+
+  const baseConfigRow = await fetchBaseConfigById(env, baseConfigId);
+  if (!baseConfigRow) return errorResponse('Base config not found', 404);
+
+  const selectorTags =
+    Array.isArray(body.selectorTags) && body.selectorTags.length
+      ? Array.from(
+          new Set(
+            body.selectorTags
+              .map((tag) => (typeof tag === 'string' ? tag.trim() : ''))
+              .filter((tag) => tag.length > 0),
+          ),
+        )
+      : [];
+
+  const id = crypto.randomUUID();
+  const selectorJson = JSON.stringify(selectorTags);
+  const shareEnabled = body.shareEnabled === true;
+  const shareToken = shareEnabled
+    ? body.shareToken?.trim() || crypto.randomUUID()
+    : null;
+
+  const insert = await env.DB.prepare(
+    `INSERT INTO sb_configs (id, base_config_id, name, description, selector_tags, share_token, share_enabled)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(id, baseConfigId, name, description, selectorJson, shareToken, shareEnabled ? 1 : 0)
+    .run();
+
+  if (!insert.success) {
+    console.error('Failed to insert sb_config', insert.error);
+    return errorResponse('Failed to create config', 500);
+  }
+
+  const groupIds =
+    Array.isArray(body.groupIds) && body.groupIds.length
+      ? Array.from(new Set(body.groupIds.filter((item) => typeof item === 'string' && item.length)))
+      : [];
+
+  if (groupIds.length > 0) {
+    const groups = await fetchGroupsByIds(env, groupIds);
+    const foundIds = new Set(groups.map((group) => group.id));
+    const missing = groupIds.filter((gid) => !foundIds.has(gid));
+    if (missing.length > 0) {
+      return errorResponse('Some groupIds were not found', 404, { groupIds: missing });
+    }
+    const statements = groupIds.map((groupId, index) =>
+      env.DB.prepare(
+        `INSERT INTO sb_config_groups (config_id, group_id, position)
+         VALUES (?, ?, ?)
+         ON CONFLICT(config_id, group_id) DO UPDATE SET position = excluded.position`,
+      ).bind(id, groupId, index),
+    );
+    await env.DB.batch(statements);
+  }
+
+  const config = await fetchConfigById(env, id);
+  if (!config) {
+    return errorResponse('Failed to load config after creation', 500);
+  }
+
+  return jsonResponse(
+    {
+      id: config.id,
+      base_config_id: config.base_config_id,
+      base_config_name: baseConfigRow.name,
+      name: config.name,
+      description: config.description,
+      selector_tags: selectorTags,
+      share_enabled: shareEnabled,
+      share_token: shareToken,
+      group_ids: groupIds,
+      created_at: config.created_at,
+      updated_at: config.updated_at,
+    },
+    201,
+  );
+}
+
+function parseGroupIds(json: string | null | undefined): string[] {
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((value) => (typeof value === 'string' ? value : '')).filter((value) => value.length > 0);
+  } catch (error) {
+    console.error('Failed to parse config group ids', error);
+    return [];
+  }
+}
+
+function formatConfigRow(row: SbConfigRow & { base_config_name: string | null; group_ids_json?: string | null }) {
+  return {
+    id: row.id,
+    base_config_id: row.base_config_id,
+    base_config_name: row.base_config_name,
+    name: row.name,
+    description: row.description,
+    selector_tags: parseSelectorTags(row.selector_tags),
+    share_enabled: Boolean(row.share_enabled),
+    share_token: row.share_token,
+    group_ids: parseGroupIds(row.group_ids_json),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+async function collectConfigLinks(env: Env, configId: string): Promise<VpnLinkRow[]> {
+  const groupRows = await fetchConfigGroups(env, configId);
+  if (groupRows.length === 0) {
+    return [];
+  }
+
+  const aggregated: VpnLinkRow[] = [];
+  for (const row of groupRows) {
+    const group = await fetchGroupById(env, row.group_id);
+    if (!group) continue;
+
+    if (group.type === 'subscription') {
+      const { links } = await resolveSubscriptionLinks(env, group.id);
+      aggregated.push(...links);
+      continue;
+    }
+
+    const { results } = await env.DB.prepare<VpnLinkRow>(
+      `SELECT l.id, l.name, l.raw_link, l.created_at, l.updated_at
+         FROM vpn_links l
+         INNER JOIN vpn_group_links gl ON gl.link_id = l.id
+         WHERE gl.group_id = ?
+         ORDER BY l.created_at ASC`,
+    )
+      .bind(row.group_id)
+      .all();
+    aggregated.push(...results);
+  }
+
+  return aggregated;
+}
+
+async function handleListConfigs(
+  request: Request,
+  env: Env,
+  _params: Record<string, string>,
+  _auth: AuthContext,
+): Promise<Response> {
+  const url = new URL(request.url);
+  if (url.searchParams.has('user_id')) {
+    console.warn('user_id filter ignored in single-admin mode');
+  }
+
+  const { results } = await env.DB.prepare<
+    SbConfigRow & { base_config_name: string | null; group_ids_json: string | null }
+  >(
+    `SELECT sc.id,
+            sc.base_config_id,
+            sc.name,
+            sc.description,
+            sc.selector_tags,
+            sc.share_token,
+            sc.share_enabled,
+            sc.created_at,
+            sc.updated_at,
+            bc.name AS base_config_name,
+            (
+              SELECT json_group_array(sub.group_id)
+                FROM (
+                  SELECT group_id
+                    FROM sb_config_groups
+                   WHERE config_id = sc.id
+                   ORDER BY position ASC, group_id ASC
+                ) AS sub
+            ) AS group_ids_json
+       FROM sb_configs sc
+       LEFT JOIN sb_base_configs bc ON bc.id = sc.base_config_id
+       ORDER BY sc.created_at DESC`,
+  ).all();
+  return jsonResponse(results.map(formatConfigRow));
+}
+
+async function handleUpdateConfig(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+  _auth: AuthContext,
+): Promise<Response> {
+  const configId = params.id;
+  if (!configId) return errorResponse('Missing config id', 400);
+
+  const existing = await fetchConfigById(env, configId);
+  if (!existing) return errorResponse('Config not found', 404);
+
+  const body = await readJsonBody<{
+    name?: string;
+    description?: string | null;
+    baseConfigId?: string;
+    selectorTags?: string[];
+    groupIds?: string[];
+  }>(request);
+  if (!body) return errorResponse('Invalid JSON payload', 400);
+
+  const updates: string[] = [];
+  const bindings: unknown[] = [];
+  let baseConfigName: string | null = null;
+  let selectorTags = parseSelectorTags(existing.selector_tags);
+
+  if (body.name !== undefined) {
+    const newName = String(body.name).trim();
+    if (!newName) return errorResponse('`name` cannot be empty', 422);
+    updates.push('name = ?');
+    bindings.push(newName);
+  }
+
+  if (body.description !== undefined) {
+    updates.push('description = ?');
+    bindings.push(body.description === null ? null : String(body.description));
+  }
+
+  if (body.baseConfigId !== undefined) {
+    const baseConfigId = body.baseConfigId.trim();
+    if (!baseConfigId) return errorResponse('`baseConfigId` cannot be empty', 422);
+    const baseConfigRow = await fetchBaseConfigById(env, baseConfigId);
+    if (!baseConfigRow) return errorResponse('Base config not found', 404);
+    updates.push('base_config_id = ?');
+    bindings.push(baseConfigId);
+    baseConfigName = baseConfigRow.name;
+  }
+
+  if (body.selectorTags !== undefined) {
+    selectorTags = Array.isArray(body.selectorTags)
+      ? Array.from(
+          new Set(
+            body.selectorTags
+              .map((tag) => (typeof tag === 'string' ? tag.trim() : ''))
+              .filter((tag) => tag.length > 0),
+          ),
+        )
+      : [];
+    updates.push('selector_tags = ?');
+    bindings.push(JSON.stringify(selectorTags));
+  }
+
+  if (updates.length > 0) {
+    updates.push("updated_at = strftime('%s','now')");
+    const statement = env.DB.prepare(`UPDATE sb_configs SET ${updates.join(', ')} WHERE id = ?`).bind(
+      ...bindings,
+      configId,
+    );
+    const result = await statement.run();
+    if (!result.success) {
+      console.error('Failed to update sb_configs', result.error);
+      return errorResponse('Failed to update config', 500);
+    }
+  }
+
+  let groupIds = body.groupIds;
+  if (body.groupIds !== undefined) {
+    groupIds = Array.isArray(body.groupIds)
+      ? Array.from(new Set(body.groupIds.filter((gid) => typeof gid === 'string' && gid.length > 0)))
+      : [];
+    const clear = await env.DB.prepare(`DELETE FROM sb_config_groups WHERE config_id = ?`).bind(configId).run();
+    if (!clear.success) {
+      console.error('Failed to clear sb_config_groups', clear.error);
+      return errorResponse('Failed to update groups', 500);
+    }
+    if (groupIds.length > 0) {
+      const groups = await fetchGroupsByIds(env, groupIds);
+      const foundIds = new Set(groups.map((group) => group.id));
+      const missing = groupIds.filter((gid) => !foundIds.has(gid));
+      if (missing.length > 0) return errorResponse('Some groupIds were not found', 404, { groupIds: missing });
+      const statements = groupIds.map((groupId, index) =>
+        env.DB.prepare(
+          `INSERT INTO sb_config_groups (config_id, group_id, position)
+           VALUES (?, ?, ?)`,
+        ).bind(configId, groupId, index),
+      );
+      await env.DB.batch(statements);
+    }
+  }
+
+  const updated = await env.DB.prepare<
+    SbConfigRow & { base_config_name: string | null; group_ids_json: string | null }
+  >(
+    `SELECT sc.id,
+            sc.base_config_id,
+            sc.name,
+            sc.description,
+            sc.selector_tags,
+            sc.share_token,
+            sc.share_enabled,
+            sc.created_at,
+            sc.updated_at,
+            bc.name AS base_config_name,
+            (
+              SELECT json_group_array(sub.group_id)
+                FROM (
+                  SELECT group_id
+                    FROM sb_config_groups
+                   WHERE config_id = sc.id
+                   ORDER BY position ASC, group_id ASC
+                ) AS sub
+            ) AS group_ids_json
+       FROM sb_configs sc
+       LEFT JOIN sb_base_configs bc ON bc.id = sc.base_config_id
+      WHERE sc.id = ?`,
+  )
+    .bind(configId)
+    .first();
+
+  if (!updated) return errorResponse('Failed to load config after update', 500);
+
+  return jsonResponse({
+    ...formatConfigRow(updated),
+    base_config_name: baseConfigName ?? updated.base_config_name,
+    selector_tags: selectorTags,
+    group_ids: groupIds !== undefined ? groupIds : parseGroupIds(updated.group_ids_json),
+  });
+}
+
+async function handleDeleteConfig(
+  _request: Request,
+  env: Env,
+  params: Record<string, string>,
+  _auth: AuthContext,
+): Promise<Response> {
+  const configId = params.id;
+  if (!configId) return errorResponse('Missing config id', 400);
+
+  const existing = await fetchConfigById(env, configId);
+  if (!existing) return errorResponse('Config not found', 404);
+
+  const deleteGroups = await env.DB.prepare(`DELETE FROM sb_config_groups WHERE config_id = ?`).bind(configId).run();
+  if (!deleteGroups.success) {
+    console.error('Failed to delete sb_config_groups', deleteGroups.error);
+    return errorResponse('Failed to delete config', 500);
+  }
+
+  const deleteConfig = await env.DB.prepare(`DELETE FROM sb_configs WHERE id = ?`).bind(configId).run();
+  if (!deleteConfig.success) {
+    console.error('Failed to delete sb_configs', deleteConfig.error);
+    return errorResponse('Failed to delete config', 500);
+  }
+
+  return jsonResponse({ success: true });
+}
+
+async function handleAttachConfigGroup(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+  _auth: AuthContext,
+): Promise<Response> {
+  const configId = params.id;
+  if (!configId) return errorResponse('Missing config id', 400);
+
+  const config = await fetchConfigById(env, configId);
+  if (!config) return errorResponse('Config not found', 404);
+
+  const body = await readJsonBody<{ groupId?: string; position?: number }>(request);
+  if (!body) return errorResponse('Invalid JSON payload', 400);
+  const groupId = body.groupId?.trim();
+  if (!groupId) return errorResponse('`groupId` is required', 422);
+
+  const group = await fetchGroupById(env, groupId);
+  if (!group) return errorResponse('Group not found', 404);
+
+  let position = Number.isInteger(body.position) ? (body.position as number) : null;
+  if (position === null) {
+    const maxRow = await env.DB.prepare<{ max_position: number }>(
+      `SELECT COALESCE(MAX(position), -1) AS max_position
+         FROM sb_config_groups
+         WHERE config_id = ?`,
+    )
+      .bind(configId)
+      .first();
+    position = (maxRow?.max_position ?? -1) + 1;
+  }
+
+  const upsert = await env.DB.prepare(
+    `INSERT INTO sb_config_groups (config_id, group_id, position)
+     VALUES (?, ?, ?)
+     ON CONFLICT(config_id, group_id) DO UPDATE SET position = excluded.position`,
+  )
+    .bind(configId, groupId, position)
+    .run();
+
+  if (!upsert.success) {
+    console.error('Failed to upsert sb_config_group', upsert.error);
+    return errorResponse('Failed to attach group', 500);
+  }
+
+  return jsonResponse({ success: true });
+}
+
+async function handleRemoveConfigGroup(
+  _request: Request,
+  env: Env,
+  params: Record<string, string>,
+  _auth: AuthContext,
+): Promise<Response> {
+  const configId = params.id;
+  const groupId = params.groupId;
+  if (!configId || !groupId) return errorResponse('Missing config or group id', 400);
+
+  const config = await fetchConfigById(env, configId);
+  if (!config) return errorResponse('Config not found', 404);
+
+  const group = await fetchGroupById(env, groupId);
+  if (!group) return errorResponse('Group not found', 404);
+
+  const remove = await env.DB.prepare(
+    `DELETE FROM sb_config_groups WHERE config_id = ? AND group_id = ?`,
+  )
+    .bind(configId, groupId)
+    .run();
+
+  if (!remove.success) {
+    console.error('Failed to delete sb_config_group', remove.error);
+    return errorResponse('Failed to detach group', 500);
+  }
+
+  return jsonResponse({ success: true });
+}
+
+async function handleUpdateConfigShare(
+  request: Request,
+  env: Env,
+  params: Record<string, string>,
+  _auth: AuthContext,
+): Promise<Response> {
+  const configId = params.id;
+  if (!configId) return errorResponse('Missing config id', 400);
+  const config = await fetchConfigById(env, configId);
+  if (!config) return errorResponse('Config not found', 404);
+
+  const body = await readJsonBody<{
+    shareEnabled?: boolean;
+    regenerate?: boolean;
+    shareToken?: string;
+  }>(request);
+  if (!body) return errorResponse('Invalid JSON payload', 400);
+
+  const enable = body.shareEnabled ?? Boolean(config.share_enabled);
+  let shareToken = config.share_token;
+  if (enable) {
+    if (body.shareToken) {
+      const trimmed = body.shareToken.trim();
+      if (trimmed.length === 0) {
+        return errorResponse('`shareToken` cannot be empty when provided', 422);
+      }
+      shareToken = trimmed;
+    }
+    if (body.regenerate || !shareToken) {
+      shareToken = crypto.randomUUID();
+    }
+  } else {
+    shareToken = null;
+  }
+
+  const update = await env.DB.prepare(
+    `UPDATE sb_configs
+        SET share_enabled = ?,
+            share_token = ?,
+            updated_at = strftime('%s','now')
+      WHERE id = ?`,
+  )
+    .bind(enable ? 1 : 0, shareToken, configId)
+    .run();
+
+  if (!update.success) {
+    console.error('Failed to update config share settings', update.error);
+    return errorResponse('Failed to update share settings', 500);
+  }
+
+  return jsonResponse({ shareEnabled: enable, shareToken });
+}
+
+async function handleGetConfig(
+  request: Request,
+  env: Env,
+  _params: Record<string, string>,
+  _auth: AuthContext,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const configId = url.searchParams.get('config_id');
+  if (!configId) return errorResponse('`config_id` query parameter is required', 422);
+
+  const configRow = await fetchConfigById(env, configId);
+  if (!configRow) return errorResponse('Config not found', 404);
+  const shareToken = url.searchParams.get('share');
+
+  let authenticated = false;
+  if (shareToken && configRow.share_enabled && configRow.share_token) {
+    if (shareToken === configRow.share_token) {
+      authenticated = true;
+    } else {
+      return errorResponse('Invalid share token', 403);
+    }
+  }
+
+  if (!authenticated) {
+    const username = await authenticateBasic(request, env);
+    if (!username) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: {
+          ...CORS_HEADERS,
+          'content-type': 'application/json; charset=utf-8',
+          'WWW-Authenticate': 'Basic realm="sing-box-admin"',
+        },
+      });
+    }
+  }
+
+  if (!configRow.base_config_id) {
+    return errorResponse('Config is missing base_config_id', 500);
+  }
+
+  const baseConfigRow = await fetchBaseConfigById(env, configRow.base_config_id);
+  if (!baseConfigRow) return errorResponse('Base config not found', 404);
+
+  const overrideSelectorTags = parseSelectorTags(configRow.selector_tags);
+  const baseSelectorTags = parseSelectorTags(baseConfigRow.selector_tags);
+  const selectorTags =
+    overrideSelectorTags.length > 0 ? overrideSelectorTags : baseSelectorTags;
+  const renderConfig = parseBaseConfig(baseConfigRow.config_json);
+
+  const allLinks = await collectConfigLinks(env, configId);
+  if (allLinks.length === 0) {
+    return jsonResponse(renderConfig);
+  }
+
+  const outbounds = await convertLinksToOutbounds(allLinks);
+  mergeGeneratedOutbounds(renderConfig, outbounds, selectorTags);
+  stripUnsupportedOutboundFields(renderConfig);
+  return jsonResponse(renderConfig);
+}
+
+async function handleConfigSubscriptionShare(
+  request: Request,
+  env: Env,
+  _params: Record<string, string>,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const configId = url.searchParams.get('config_id')?.trim();
+  if (!configId) {
+    return errorResponse('`config_id` query parameter is required', 422);
+  }
+
+  const config = await fetchConfigById(env, configId);
+  if (!config || !config.share_enabled || !config.share_token) {
+    return errorResponse('Config not found', 404);
+  }
+
+  const providedToken =
+    url.searchParams.get('share')?.trim() ??
+    url.searchParams.get('shareuuid')?.trim() ??
+    url.searchParams.get('token')?.trim() ??
+    '';
+  if (!providedToken) {
+    return errorResponse('Missing share token', 422);
+  }
+
+  if (providedToken !== config.share_token) {
+    return errorResponse('Invalid share token', 403);
+  }
+
+  const links = await collectConfigLinks(env, configId);
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const link of links) {
+    const trimmed = link.raw_link.trim();
+    if (!trimmed.length) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    lines.push(trimmed);
+  }
+
+  const body = lines.join('\n');
+  return new Response(body, {
+    status: 200,
+    headers: {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+      ...CORS_HEADERS,
+    },
+  });
+}
+
+export const configRoutes: RouteDefinition[] = [
+  {
+    method: 'POST',
+    pattern: new URLPattern({ pathname: '/api/configs' }),
+    handler: requireAuth(handleCreateConfig),
+  },
+  {
+    method: 'GET',
+    pattern: new URLPattern({ pathname: '/api/configs' }),
+    handler: requireAuth(handleListConfigs),
+  },
+  {
+    method: 'PUT',
+    pattern: new URLPattern({ pathname: '/api/configs/:id' }),
+    handler: requireAuth(handleUpdateConfig),
+  },
+  {
+    method: 'POST',
+    pattern: new URLPattern({ pathname: '/api/configs/:id/groups' }),
+    handler: requireAuth(handleAttachConfigGroup),
+  },
+  {
+    method: 'DELETE',
+    pattern: new URLPattern({ pathname: '/api/configs/:id/groups/:groupId' }),
+    handler: requireAuth(handleRemoveConfigGroup),
+  },
+  {
+    method: 'POST',
+    pattern: new URLPattern({ pathname: '/api/configs/:id/share' }),
+    handler: requireAuth(handleUpdateConfigShare),
+  },
+  {
+    method: 'DELETE',
+    pattern: new URLPattern({ pathname: '/api/configs/:id' }),
+    handler: requireAuth(handleDeleteConfig),
+  },
+  {
+    method: 'GET',
+    pattern: new URLPattern({ pathname: '/api/config' }),
+    handler: handleGetConfig,
+  },
+  {
+    method: 'GET',
+    pattern: new URLPattern({ pathname: '/api/sub' }),
+    handler: handleConfigSubscriptionShare,
+  },
+];

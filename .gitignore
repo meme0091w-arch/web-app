@@ -1,0 +1,44 @@
+.DS_Store
+
+# Node tooling
+node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.pnp/
+.pnp.*
+
+# Wrangler state
+.wrangler/
+**/.wrangler/
+worker/wrangler.toml
+
+# Local runtime artifacts
+run.out
+run.pid
+cache.db
+*.sqlite
+
+# Environment & secrets
+.env
+.env.*
+
+# Build caches
+dist/
+.cache/
+.next/
+out/
+build/
+
+# Test & coverage output
+coverage/
+
+# Framework artifacts
+next-env.d.ts
+*.tsbuildinfo
+.vercel/
+
+# Misc
+*.pem
+.yarn/
